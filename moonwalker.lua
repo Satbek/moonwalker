@@ -148,7 +148,8 @@ local function moonwalker(opts)
 	local batch_update
 	
 	if opts.fp and opts.fp > 1 then
-		batch_update = batch_update_f
+		require'log'.error("fiber pool temporary disabled")
+		batch_update = batch_update_s
 	else
 		batch_update = batch_update_s
 	end
