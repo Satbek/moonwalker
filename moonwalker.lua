@@ -64,8 +64,10 @@ local function moonwalker(opts)
 	local dryrun = opts.dryrun or false
 	local limit = opts.limit or 2^63
 	local printevery = opts.progress or '2%'
+	local commit = opts.commit or takeby * 100
+	local continue = opts.continue or opts.cont
 	local silent = opts.silent
-	if not opts.fp then opts.fp = 3 end
+	if not opts.fp then opts.fp = 1 end
 
 	local index      = opts.index or space.index[0]
 	local keyfields  = create_keyfields(index)
@@ -92,7 +94,10 @@ local function moonwalker(opts)
 	end
 
 	if not silent then
-		log.info("Processing %d items in %s mode; wait: 1/%d; take: %d / %d %s", size, dryrun and "dryrun" or "real", waitevery, takeby, opts.fp or 1, opts.txn and "txn" or "single")
+		log.info("Processing %d items in %s mode; wait: 1/%d; take: %d / %d %s; fid=%s; %s",
+			size, dryrun and "dryrun" or "real", waitevery, takeby, opts.fp or 1,
+			opts.txn and "txn" or "single",
+			fiber.id(), continue and "from "..tostring(box.tuple.new(continue)) or '')
 	end
 
 	local working = true
@@ -154,15 +159,23 @@ local function moonwalker(opts)
 		batch_update = batch_update_s
 	end
 
-	local it = iiterator( index, box.index.ALL )
+	local it
+	if continue then
+		it = iiterator( index, box.index.GT, continue )
+	else
+		it = iiterator( index, box.index.ALL )
+	end
+
 	local v
 	local toupdate = {}
 	local c = 0
 	local u = 0
+	local commit_at
 	local csw   = 0
 	local clock_sum = 0
 	local clock1 = clock.proc()
 
+	local function work() -- noindent, commit separatedlty
 	while working do c = c + 1
 		if c % waitevery == 0 then
 			clock_sum = clock_sum + ( clock.proc() - clock1 )
@@ -181,16 +194,18 @@ local function moonwalker(opts)
 		end
 		
 		if not examine or examine(v) then
+			if not commit_at then commit_at = c + commit end
 			u = u + 1
 			table.insert(toupdate, v)
 		end
 		
-		if #toupdate >= takeby then
+		if #toupdate >= takeby or c >= commit_at then
 			clock_sum = clock_sum + ( clock.proc() - clock1 )
 			csw = csw + 1
 			batch_update(toupdate)
 			clock1 = clock.proc()
 			toupdate = {}
+			commit_at = nil
 			it = iiterator(index, box.index.GT, keyfields(v))
 		end
 		
@@ -203,7 +218,7 @@ local function moonwalker(opts)
 				local rps1 = printevery/run1
 				collectgarbage("collect")
 				local mem = collectgarbage("count")
-				log.info("Processed %d (%d) (%0.1f%%) in %0.3fs (rps: %.0f tot; %.0f/%.1fs; %.2fms/c) ETA:+%ds (or %ds) Mem: %dK",
+				log.info("Processed %d (%d) (%0.1f%%) in %0.3fs (rps: %.0f tot; %.0f/%.1fs; %.2fms/c) ETA:+%ds (or %ds) Mem: %dK %s",
 					c, u,
 					100*c/size,
 					run,
@@ -213,17 +228,38 @@ local function moonwalker(opts)
 					(size - c)/rps1,
 					(size - c)/rps,
 					
-					mem
+					mem,
+					box.tuple.new(keyfields(v))
 				)
 			end)
 			if not r then print(e) end
 			prev = now
 		end
-	end
+	end -- noindent, commit separatedlty
 	if not silent then
 		log.info("Processed %d, updated %d items in %s mode; wait: 1/%d; take: %d / %d %s", c-1, u, dryrun and "dryrun" or "real", waitevery, takeby, opts.fp or 1, opts.txn and "txn" or "single")
 	end
 	return { processed = c-1; updated = u; yields = csw }
+	end
+	if opts.bg or opts.background then
+		local name = opts.name or string.sub('moonwalker.'..space.name,1,32)
+		local fib = fiber.create(function()
+			fiber.name(name)
+			if not silent then log.info("Started fiber %s",fiber.id()) end
+			fiber.sleep(0.1)
+			local r,e = pcall(work)
+			if not r then
+				log.error("Failed processing on step N %s with %s. Last tuple was %s", c, e, v and tostring(v) or '-')
+			end
+		end)
+		if not silent then log.info("Started fiber %s/%s. Cancel: require'fiber'.find(%s):cancel()", fib:id(), name, fib:id()) end
+		return {
+			fiber = fib;
+			cancel = string.format("require'fiber'.find(%s):cancel()",fib:id());
+		}
+	else
+		return work()
+	end
 end
 
 return moonwalker
