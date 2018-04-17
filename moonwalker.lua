@@ -199,7 +199,7 @@ local function moonwalker(opts)
 			table.insert(toupdate, v)
 		end
 		
-		if #toupdate >= takeby or c >= commit_at then
+		if #toupdate >= takeby or (commit_at and c >= commit_at) then
 			clock_sum = clock_sum + ( clock.proc() - clock1 )
 			csw = csw + 1
 			batch_update(toupdate)
